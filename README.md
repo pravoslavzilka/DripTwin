@@ -213,5 +213,5 @@ It holds once the flow is within ±5% of the target and corrects again beyond ±
 
 ## Team
 
-- _Name_ — _role_
-- _Name_ — _role_
+- Yeonseul Noh — fluids calculations and measurements 
+- Bishal Neupane — Computer vision and agent-in-loop integration 
