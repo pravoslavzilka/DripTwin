@@ -1,16 +1,19 @@
 """OpenCV drop counter for the drip chamber.
 
-One region of interest, the orifice ROI: the pendant drop hanging from the
-drip tube. It grows slowly then vanishes in one frame when it detaches. Even
-at 30 fps the drop hangs for >1 s, so this can't be missed the way a
-fast-falling drop can.
+Counts splashes. One region of interest, the splash box, sits where each drop
+lands in the fluid at the bottom of the chamber. A landing throws up a burst of
+light and ripples that is far bigger than the drop itself and always in the same
+place, so it is the most reliable thing to count (on a real recording: 75/75
+drops from the splash vs 51/75 from the falling drop).
 
 The signal is reference-free: mean absolute frame-to-frame change inside the
-ROI. Slow growth barely changes it; a detach spikes it. The threshold adapts
-to the scene noise (rolling median + k * MAD), so lighting changes don't need
-retuning. A refractory window stops one drop being counted twice.
+box. The threshold adapts to the scene noise (rolling median + k * MAD), so
+lighting changes don't need retuning. A refractory window stops one drop's
+splash and ripples being counted twice. A change outside the box as big as the
+one inside (a hand, a bump, a light) never counts.
 
-Run standalone to pick ROIs and see what the detector sees:
+With no saved box, the detector watches the first ~10 s and puts the box on the
+spot that changes most, which is the splash. Run standalone to check or adjust:
     python -m driptwin.vision --camera 0 --calibrate
 """
 
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import time
 from collections import deque
@@ -44,17 +48,37 @@ class ROI:
 
 @dataclass
 class ROIConfig:
-    orifice: ROI
+    splash: ROI
 
     def save(self, path: Path = ROI_FILE) -> None:
-        path.write_text(json.dumps({"orifice": asdict(self.orifice)}))
+        path.write_text(json.dumps({"splash": asdict(self.splash)}))
 
     @classmethod
     def load(cls, path: Path = ROI_FILE) -> "ROIConfig | None":
         if not path.exists():
             return None
-        roi = ROI(**json.loads(path.read_text())["orifice"])
-        return cls(roi) if roi.w > 0 and roi.h > 0 else None   # empty box: use defaults
+        saved = json.loads(path.read_text())
+        roi = ROI(**(saved.get("splash") or saved["orifice"]))   # "orifice": older files
+        return cls(roi) if roi.w > 0 and roi.h > 0 else None   # empty box: find it again
+
+
+LOCATE_SCALE = 4        # splash search runs on quarter-size difference images
+
+
+def locate_splash(diffs: np.ndarray, scale: int = LOCATE_SCALE, frac: float = 0.5) -> ROI | None:
+    """Box around the spot that changes most over a few seconds of difference
+    images: per pixel, the 99th percentile of change; then the biggest blob above
+    half the peak. Drops land every second or so, so the splash dominates; a
+    one-off movement only touches a few frames and stays under the 99th percentile."""
+    m = np.percentile(diffs, 99, axis=0)
+    if m.max() < 8:                    # nothing moving: no drops yet
+        return None
+    mask = (m > frac * m.max()).astype(np.uint8)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x, y, w, h = (int(v) * scale for v in stats[i, :4])
+    pad = 2 * scale
+    return ROI(max(0, x - pad), max(0, y - pad), w + 2 * pad, h + 2 * pad)
 
 
 class SpikeDetector:
@@ -76,7 +100,7 @@ class SpikeDetector:
     """
 
     def __init__(self, k: float = 6.0, history: int = 150, refractory_s: float = 0.3,
-                 floor: float = 1.5, ratio: float = 3.5, warmup: int = 90, forget_s: float = 8.0):
+                 floor: float = 1.5, ratio: float = 2.0, warmup: int = 90, forget_s: float = 8.0):
         self.k, self.refractory_s, self.floor, self.ratio = k, refractory_s, floor, ratio
         self.warmup, self.forget_s = warmup, forget_s
         self.hist: deque[float] = deque(maxlen=history)
@@ -92,9 +116,14 @@ class SpikeDetector:
         if self.spikes and t - self.last_fire > self.forget_s:
             self.spikes.clear()                # long gap: relearn the drop size
         h = np.fromiter(self.hist, float)
-        med = float(np.median(h))
-        mad = float(np.median(np.abs(h - med))) * 1.4826
-        self.threshold = max(med + max(self.k * mad, self.floor), self.ratio * med,
+        # Noise level from the quietest frames only. At fast drips splash frames are
+        # a big share of all frames; once one slipped into the history it lifted the
+        # median and spread, the threshold rose over the next spike, that spike was
+        # learned as noise too, and counting stopped for good.
+        p5, p30 = np.percentile(h, (5, 30))
+        sigma = (p30 - p5) / 1.12                     # gaussian: p30 - p5 = 1.12 sigma
+        base = p30 + 0.52 * sigma                     # ~ the noise median
+        self.threshold = max(base + max(self.k * sigma, self.floor), self.ratio * base,
                              0.4 * max(self.spikes, default=0.0))
         fire = False
         if x > self.threshold:
@@ -111,15 +140,25 @@ class SpikeDetector:
 
 
 class DropDetector:
-    def __init__(self, rois: ROIConfig, refractory_s: float = 0.3):
+    """rois=None: find the splash box automatically from the first `locate_frames`."""
+
+    def __init__(self, rois: ROIConfig | None, refractory_s: float = 0.3,
+                 locate_frames: int = 300):
         self.rois = rois
         self.refractory_s = refractory_s
-        self.det_orifice = SpikeDetector()
-        self.scene: deque[float] = deque(maxlen=300)    # whole-frame change, last ~10 s
+        self.locate_frames = locate_frames
+        self._seen: list[np.ndarray] = []              # small diffs while locating
+        self.det_splash = SpikeDetector()
+        self.scene: deque[float] = deque(maxlen=300)    # change outside the box, last ~10 s
+        self._busy_run = 0                              # frames in a row the outside was busy
         self.prev: np.ndarray | None = None
         self.last_drop = -1e9
         self.count = 0
         self.trace: deque[float] = deque(maxlen=200)   # for the preview plot
+
+    @property
+    def locating(self) -> bool:
+        return self.rois is None
 
     @staticmethod
     def _prep(frame: np.ndarray) -> np.ndarray:
@@ -133,56 +172,101 @@ class DropDetector:
             return False
         diff = cv2.absdiff(g, self.prev)
         self.prev = g
-        s_or = float(self.rois.orifice.crop(diff).mean())
-        # A drop changes only the box; a hand, a bump or a light changes the whole picture.
-        s_all = float(diff.mean())
-        disturbed = len(self.scene) > 30 and s_all > 4.0 * float(np.median(self.scene)) + 0.5
-        self.scene.append(s_all)
-        fired = self.det_orifice.update(s_or, t, disturbed)
-        self.trace.append(s_or)
+        if self.rois is None:
+            self._locate(diff)
+            return False
+        r = self.rois.splash
+        box = r.crop(diff)
+        s_box = float(box.mean())
+        area_all, area_box = diff.size, box.size
+        s_out = (float(diff.mean()) * area_all - s_box * area_box) / max(area_all - area_box, 1)
+        # A splash flashes the backlight across the chamber: about a fifth of the
+        # picture outside the box changes too, for 2-3 frames, less than the box
+        # does. A hand, a bump or a light changes most of the picture, or more
+        # outside than in the box, or keeps changing it for many frames.
+        changed_out = (np.count_nonzero(diff > 20) - np.count_nonzero(box > 20)) / max(area_all - area_box, 1)
+        busy = len(self.scene) > 30 and s_out > 4.0 * float(np.median(self.scene)) + 0.5
+        disturbed = busy and (changed_out > 0.5 or s_out > 1.5 * s_box or self._busy_run >= 4)
+        self._busy_run = self._busy_run + 1 if busy else 0
+        self.scene.append(s_out)
+        fired = self.det_splash.update(s_box, t, disturbed)
+        self.trace.append(s_box)
         if fired and t - self.last_drop > self.refractory_s:
             self.last_drop = t
             self.count += 1
             return True
         return False
 
+    def _locate(self, diff: np.ndarray) -> None:
+        self._seen.append(cv2.resize(diff, None, fx=1 / LOCATE_SCALE, fy=1 / LOCATE_SCALE,
+                                     interpolation=cv2.INTER_AREA))
+        if len(self._seen) >= self.locate_frames:
+            roi = locate_splash(np.stack(self._seen))
+            self._seen = []                            # nothing moving: look again
+            if roi:
+                self.rois = ROIConfig(roi)
+                print(f"[vision] splash box found: {asdict(roi)}")
+
     def annotate(self, frame: np.ndarray) -> np.ndarray:
         img = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        if self.rois is None:
+            left = (self.locate_frames - len(self._seen)) / 30
+            cv2.putText(img, f"finding the splash... {left:.0f} s", (8, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            return img
         flash = time.monotonic() - self.last_drop < 0.15
-        roi = self.rois.orifice
+        roi = self.rois.splash
         cv2.rectangle(img, (roi.x, roi.y), (roi.x + roi.w, roi.y + roi.h),
                       (0, 255, 0) if flash else (0, 200, 255), 2)
         cv2.putText(img, f"drops {self.count}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 255, 255), 2)
-        # sparkline of the orifice signal vs its adaptive threshold
+        # sparkline of the splash signal vs its adaptive threshold
         h, w = img.shape[:2]
         if len(self.trace) > 2:
             vals = np.array(self.trace)
-            top = max(vals.max(), self.det_orifice.threshold if np.isfinite(
-                self.det_orifice.threshold) else 1, 1e-3)
+            top = max(vals.max(), self.det_splash.threshold if np.isfinite(
+                self.det_splash.threshold) else 1, 1e-3)
             pts = [(int(i * w / len(vals)), int(h - 4 - v / top * 40)) for i, v in enumerate(vals)]
             cv2.polylines(img, [np.array(pts, np.int32)], False, (0, 200, 255), 1)
-            if np.isfinite(self.det_orifice.threshold):
-                ty = int(h - 4 - self.det_orifice.threshold / top * 40)
+            if np.isfinite(self.det_splash.threshold):
+                ty = int(h - 4 - self.det_splash.threshold / top * 40)
                 cv2.line(img, (0, ty), (w, ty), (80, 80, 80), 1)
         return img
 
 
 def default_rois(w: int, h: int) -> ROIConfig:
-    return ROIConfig(ROI(int(w * 0.38), int(h * 0.08), int(w * 0.24), int(h * 0.16)))
+    """Fallback box: lower middle, where the fluid surface usually is."""
+    return ROIConfig(ROI(int(w * 0.3), int(h * 0.55), int(w * 0.4), int(h * 0.3)))
 
 
 DISPLAY_W = 960      # preview windows wider than this lag on a laptop screen
 
 
+def _measure_fps(cap: cv2.VideoCapture, frames: int = 12) -> float:
+    cap.read()
+    t = time.monotonic()
+    got = sum(cap.read()[0] for _ in range(frames))
+    return got / max(time.monotonic() - t, 1e-3)
+
+
 def open_camera(camera: int | str) -> cv2.VideoCapture:
     """Webcams are opened at 1280x720/30 fps: plenty for a drop, and calibration
-    and counting always see the same pixel grid, so the saved box lines up."""
-    cap = cv2.VideoCapture(camera)
-    if not isinstance(camera, str):
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+    and counting always see the same pixel grid, so the saved box lines up.
+
+    On Windows, DirectShow: the default backend can take a minute to open a
+    camera. Some webcams only send uncompressed video there, which manages
+    ~5 fps at 720p; a falling drop needs ~30, so those drop to 640x480."""
+    if isinstance(camera, str):
+        return cv2.VideoCapture(camera)
+    win = sys.platform == "win32"
+    cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW) if win else cv2.VideoCapture(camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    if win and cap.isOpened() and _measure_fps(cap) < 20:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        print(f"[vision] camera {camera} is slow at 720p; using 640x480 for 30 fps")
     return cap
 
 
@@ -209,14 +293,23 @@ class CameraCounter(threading.Thread):
         self._halt = threading.Event()
 
     def run(self) -> None:
-        cap = open_camera(self.camera)
-        ok, frame = cap.read()
+        # Keep trying: on Windows a camera another program just released can refuse
+        # to open for a moment, and at a demo it may be plugged in late.
+        while True:
+            cap = open_camera(self.camera)
+            ok, frame = cap.read()
+            if ok or isinstance(self.camera, str) or self._halt.wait(2.0):
+                break
+            cap.release()
+            if self.error is None:
+                self.error = f"camera {self.camera} not available"
+                print(f"[vision] {self.error}; retrying every 2 s")
         if not ok:
             self.error = f"camera {self.camera} not available"
             print(f"[vision] {self.error}")
             return
-        rois = self.rois or ROIConfig.load() or default_rois(frame.shape[1], frame.shape[0])
-        det = DropDetector(rois)
+        self.error = None
+        det = DropDetector(self.rois or ROIConfig.load())      # None: find the splash
         self.alive = True
         # A video file would otherwise be read as fast as the CPU allows, which
         # squashes time and inflates the rate: play it at its own fps, looping.
@@ -259,9 +352,8 @@ def calibrate(camera: int | str) -> None:
     if not ok:
         raise SystemExit(f"camera {camera} not available")
     saved = ROIConfig.load()
-    rois = saved or default_rois(frame.shape[1], frame.shape[0])
-    det = DropDetector(rois)
-    win = "calibrate: drag a box | s = save | r = reset | q = quit"
+    det = DropDetector(saved)                   # no saved box: find the splash
+    win = "calibrate: drag a box | a = auto | s = save | r = reset | q = quit"
     drag: dict = {}
     scale = fit(frame)[1]
 
@@ -281,7 +373,8 @@ def calibrate(camera: int | str) -> None:
 
     cv2.namedWindow(win)
     cv2.setMouseCallback(win, on_mouse)
-    print("Drag a tight box around the drip tip and hanging drop on the live video.\n"
+    print("Put the box over the splash, where drops land in the fluid. Press a to find it\n"
+          "automatically (watches ~10 s of drops), or drag a box on the live video.\n"
           "Each drop should flash the box green once (after ~3 s warm-up).\n"
           "s = save, r = reset to the saved box, q = quit without saving.")
     # video files: wait one frame period so drops arrive in real time
@@ -291,17 +384,19 @@ def calibrate(camera: int | str) -> None:
         img = det.annotate(frame)
         if "start" in drag:
             cv2.rectangle(img, drag["start"], drag["end"], (255, 255, 255), 1)
-        if len(det.det_orifice.hist) < det.det_orifice.warmup:
+        if not det.locating and len(det.det_splash.hist) < det.det_splash.warmup:
             cv2.putText(img, "learning the scene...", (8, 44), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (0, 200, 255), 2)
         cv2.imshow(win, fit(img)[0])
         key = cv2.waitKey(wait_ms) & 0xFF
-        if key == ord("s"):
+        if key == ord("s") and not det.locating:
             det.rois.save()
-            print(f"saved {ROI_FILE}: {asdict(det.rois.orifice)}")
+            print(f"saved {ROI_FILE}: {asdict(det.rois.splash)}")
             break
+        if key == ord("a"):
+            det = DropDetector(None)
         if key == ord("r"):
-            det = DropDetector(saved or default_rois(frame.shape[1], frame.shape[0]))
+            det = DropDetector(saved)
         if key == ord("q"):
             print("quit, nothing saved")
             break
@@ -316,8 +411,7 @@ def preview(camera: int | str) -> None:
     ok, frame = cap.read()
     if not ok:
         raise SystemExit(f"camera {camera} not available")
-    rois = ROIConfig.load() or default_rois(frame.shape[1], frame.shape[0])
-    det = DropDetector(rois)
+    det = DropDetector(ROIConfig.load())       # no saved box: find the splash
     drops: deque[float] = deque(maxlen=10)
     # video files: wait one frame period so playback (and the rate) is real time
     wait_ms = max(1, int(1000 / (cap.get(cv2.CAP_PROP_FPS) or 30))) if isinstance(camera, str) else 1

@@ -6,6 +6,8 @@ the valve. Its tools are deliberately narrow:
   propose_order -> validates + converts mL/h to drops/min, stores as pending
   start_infusion -> only starts the order that was proposed and read back
   pause / resume / set_bag_height / get_status / log_note
+  get_flow_history / find_flow_gaps / get_time_to_empty -> fixed read-only queries
+      on the Tiger Data aggregates (timeseries.py), never free-form SQL
 
 Valve position comes from the controller; hard limits live in firmware.
 """
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import asdict
@@ -22,9 +25,16 @@ from typing import Callable
 import anthropic
 import httpx
 
+from . import timeseries
+from .physics import DROP_CURVES, drop_volume_ml
 from .twin import DripTwin, Order, OrderRejected, validate_order
 
 MODEL = "claude-opus-5-5"
+
+# Words that count as the person confirming a read-back order (English and Spanish).
+CONFIRM = re.compile(r"\b(confirm(ed)?|yes|yeah|yep|correct|affirmative|go ahead|"
+                     r"confirmo|confirmado|s[ií]|correcto|adelante)\b", re.I)
+LANG_NAMES = {"es": "Spanish"}
 
 SYSTEM = """You are DripTwin, a voice assistant clipped onto a gravity IV line. You talk \
 with nurses, field medics and vets through a speaker, so every reply is spoken aloud.
@@ -41,14 +51,17 @@ translate it.
 
 What you can do:
 - Take infusion orders. Always call propose_order first, read the result back (rate, set, \
-drops per minute, volume), and ask for confirmation. Call start_infusion only after the \
-person clearly confirms that exact order. "100 mL in one hour" means 100 mL per hour, 100 mL to give. If the volume to give or the bag size is missing, ask. The drip set is calibrated (the device knows its drop size at every rate), so never ask for a drop factor.
+drops per minute, volume), and ask the person to say "confirm". Call start_infusion only \
+when their next message confirms that exact order; the device rejects a start in the same \
+turn as the proposal or without a spoken confirmation. If an order is missing the drop \
+factor or volume, ask.
 - Explain what the line is doing using get_status. The status includes a physics "digital \
 twin": the implied head (bag height above the site) is back-calculated from drop rate and \
 valve position. A step change in implied head with no valve change means the bag or patient \
 moved. No drops with plenty of fluid left, even after the valve opened, means a kink or \
 occlusion. No drops with the bag nearly empty means an empty bag.
 - Pause, resume, record the bag height, and log notes.
+- For the past and the future ("what happened in the last ten minutes", "when will the \nbag run out", "did it stop earlier"), use get_flow_history, find_flow_gaps and \nget_time_to_empty. They read the infusion log; use get_status for the present.
 - If get_status shows monitor_only, no valve is connected: the webcam is only counting \
 drops. Answer count and rate questions from it. Mention that infusions can't be started \
 only when someone asks to start or change one.
@@ -59,6 +72,8 @@ firmware enforces safety limits you cannot change.
 - Never recommend drugs or doses. You run the order you are given, within device limits.
 - For any alarm, say what to physically check. If unsure, tell them to check the patient \
 and the line by hand.
+- A turn may start with [reply in Spanish]: then answer in Spanish, whatever language the \
+question was in. Otherwise answer in English.
 - Device events and a live status snapshot arrive in brackets at the start of a user turn; \
 they come from the device, not the person. The snapshot is current as of the question, so \
 answer from it directly; call get_status only to re-check after you change something."""
@@ -73,11 +88,12 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "rate_ml_h": {"type": "number", "description": "Ordered rate in mL per hour"},
+                "drop_factor": {"type": "integer", "description": "Set calibration in drops/mL: 10, 15, 20 or 60"},
                 "vtbi_ml": {"type": "number", "description": "Volume to be infused in mL"},
                 "bag_volume_ml": {"type": "number", "description": "Volume currently in the bag, mL"},
                 "drug": {"type": "string", "description": "Fluid or drug name as stated"},
             },
-            "required": ["rate_ml_h", "vtbi_ml", "bag_volume_ml", "drug"],
+            "required": ["rate_ml_h", "drop_factor", "vtbi_ml", "bag_volume_ml", "drug"],
             "additionalProperties": False,
         },
         "strict": True,
@@ -137,6 +153,7 @@ TOOLS = [
         "strict": True,
     },
 ]
+TOOLS += timeseries.TOOLS
 
 
 class Agent:
@@ -153,12 +170,17 @@ class Agent:
         self.messages: list[dict] = []
         self.pending: Order | None = None
         self._events_seen = 0
+        self._turn = 0              # one per question; read-back and confirm must be different turns
+        self._pending_turn = -1
+        self._last_text = ""        # the person's own words this turn, not the model's paraphrase
 
     def _connect(self):
         return anthropic.Anthropic()
 
     # ---- tools -------------------------------------------------------------
     def _tool(self, name: str, args: dict) -> tuple[str, bool]:
+        if name in timeseries.TOOL_NAMES:   # database round trip: don't hold the twin's lock
+            return timeseries.run_tool(name, args)
         with self.lock:   # the control loop ticks the twin from another thread
             return self._tool_locked(name, args)
 
@@ -166,23 +188,36 @@ class Agent:
         t = self.clock()
         if name == "propose_order":
             try:
-                order = Order(float(args["rate_ml_h"]), float(args["vtbi_ml"]),
-                              float(args["bag_volume_ml"]), args.get("drug") or "fluid")
+                order = Order(float(args["rate_ml_h"]), int(args["drop_factor"]),
+                              float(args["vtbi_ml"]), float(args["bag_volume_ml"]),
+                              args.get("drug") or "fluid")
                 validate_order(order)
                 if self.twin.monitor_only:
                     raise OrderRejected("monitor-only mode, no valve connected")
             except (OrderRejected, ValueError, KeyError) as e:
                 return f"Rejected by device limits: {e}", True
-            self.pending = order
+            self.pending, self._pending_turn = order, self._turn
             hours = order.vtbi_ml / order.rate_ml_h
             return json.dumps({**asdict(order),
                                "drops_per_min": round(order.target_gtt_min, 1),
+                               "ml_per_drop": round(drop_volume_ml(order.target_gtt_min,
+                                                                   order.drop_factor), 4),
+                               "drop_size": ("measured for this set" if order.drop_factor
+                                             in DROP_CURVES else "nominal 1/drop factor"),
                                "seconds_per_drop": round(60 / order.target_gtt_min, 2),
                                "duration_h": round(hours, 2),
                                "status": "pending - read back and get confirmation"}), False
         if name == "start_infusion":
             if self.pending is None:
                 return "No pending order. Call propose_order first.", True
+            # Enforced here, not only in the prompt: no start without a spoken "confirm"
+            # that came after the read-back.
+            if self._pending_turn == self._turn:
+                return ("Not started: read the order back and wait for the person to confirm "
+                        "in their next message."), True
+            if not CONFIRM.search(self._last_text):
+                return ("Not started: the person hasn't confirmed. Read the order back and ask "
+                        "them to say confirm."), True
             try:
                 self.twin.start(self.pending, t)
             except OrderRejected as e:
@@ -229,17 +264,34 @@ class Agent:
     def _turn_context(self, lang: str = "en") -> str:
         # Live status rides along with the question, so most answers need no
         # get_status round trip: one model call instead of two.
-        return (self._device_context() + f"[live status: {self._status(self.clock())}]\n"
-                + ("[reply in Spanish]\n" if lang == "es" else ""))
+        reply_in = f"[reply in {LANG_NAMES[lang]}]\n" if lang in LANG_NAMES else ""
+        return (reply_in + self._device_context()
+                + f"[live status: {self._status(self.clock())}]\n")
 
-    def ask(self, text: str, lang: str = "en") -> str:
+    def _begin(self, text: str, lang: str) -> str:
         with self.lock:
-            ctx = self._turn_context(lang)
+            self._turn += 1
+            self._last_text = text
+            return self._turn_context(lang)
+
+    def ask(self, text: str, on_text: Callable[[str], None] | None = None,
+            lang: str = "en") -> str:
+        """Answer one question. on_text gets the reply as it's written, for streaming
+        speech; the return value is the same text in full."""
+        ctx = self._begin(text, lang)
+        said: list[str] = []
+
+        def emit(t: str) -> None:
+            said.append(t)
+            if on_text:
+                on_text(t)
         start = len(self.messages)
         self.messages.append({"role": "user", "content": ctx + text})
         try:
             for _ in range(6):
-                resp = self.client.beta.messages.create(
+                if said and not said[-1].endswith((" ", "\n")):
+                    emit(" ")                          # text before and after a tool call
+                with self.client.beta.messages.stream(
                     model=MODEL,
                     max_tokens=8000,                   # thinking counts toward this
                     system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
@@ -248,16 +300,23 @@ class Agent:
                     output_config={"effort": "low"},   # spoken replies: favour latency
                     betas=["server-side-fallback-2026-07-01"],
                     fallbacks="default",
-                )
+                ) as stream:
+                    for delta in stream.text_stream:
+                        emit(delta)
+                    resp = stream.get_final_message()
                 if resp.stop_reason == "refusal":
                     # drop the whole turn: a tool_use left without its result breaks every later request
                     del self.messages[start:]
-                    return "I can't help with that one. Please check the line and the patient directly."
+                    emit(" I can't help with that one. Please check the line and the patient directly.")
+                    return "".join(said).strip()
                 self.messages.append({"role": "assistant", "content": resp.content})
                 calls = [b for b in resp.content if b.type == "tool_use"]
                 if resp.stop_reason != "tool_use" or not calls:
-                    reply = " ".join(b.text for b in resp.content if b.type == "text").strip()
-                    return reply or "Sorry, I didn't get an answer out. Could you ask again?"
+                    reply = "".join(said).strip()
+                    if not reply:
+                        reply = "Sorry, I didn't get an answer out. Could you ask again?"
+                        emit(reply)
+                    return reply
                 results = []
                 for c in calls:
                     out, err = self._tool(c.name, c.input)
@@ -267,7 +326,8 @@ class Agent:
         except Exception:
             del self.messages[start:]     # don't leave a half-finished turn in the history
             raise
-        return "Sorry, I lost track there. Could you say that again?"
+        emit(" Sorry, I lost track there. Could you say that again?")
+        return "".join(said).strip()
 
 
 class GeminiAgent(Agent):
@@ -287,9 +347,14 @@ class GeminiAgent(Agent):
         key = os.environ.get("GEMINI_API_KEY") or os.environ["GOOGLE_API_KEY"]
         return httpx.Client(headers={"Authorization": f"Bearer {key}"}, timeout=30)
 
-    def ask(self, text: str, lang: str = "en") -> str:
-        with self.lock:
-            ctx = self._turn_context(lang)
+    def ask(self, text: str, on_text: Callable[[str], None] | None = None,
+            lang: str = "en") -> str:
+        reply = self._ask(self._begin(text, lang), text)
+        if on_text:
+            on_text(reply)                        # no streaming here: speak it in one go
+        return reply
+
+    def _ask(self, ctx: str, text: str) -> str:
         start = len(self.messages)
         self.messages.append({"role": "user", "content": ctx + text})
         try:

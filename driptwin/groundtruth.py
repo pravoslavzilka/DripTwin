@@ -57,7 +57,7 @@ def record(camera: int | str, seconds: float, name: str) -> None:
     while ok and time.monotonic() - t0 < seconds:
         times.append(time.monotonic() - t0)
         writer.write(frame)
-        r = rois.orifice
+        r = rois.splash
         view = frame.copy()
         cv2.rectangle(view, (r.x, r.y), (r.x + r.w, r.y + r.h), (0, 200, 255), 2)
         cv2.putText(view, f"{times[-1]:5.1f} s   drops you marked: {len(taps)}", (8, 28),
@@ -72,7 +72,7 @@ def record(camera: int | str, seconds: float, name: str) -> None:
     writer.release()
     cap.release()
     cv2.destroyAllWindows()
-    meta = {"frame_times": times, "taps": taps, "box": vars(rois.orifice)}
+    meta = {"frame_times": times, "taps": taps, "box": vars(rois.splash)}
     (OUT / f"{name}.json").write_text(json.dumps(meta))
     print(f"saved {OUT / name}.mp4 and .json: {len(times)} frames "
           f"({len(times) / times[-1]:.1f} fps), {len(taps)} drops marked")
@@ -111,7 +111,7 @@ def evaluate(video: str, box: str | None) -> None:
     times, taps = meta["frame_times"], meta["taps"]
     roi = ROI(*map(int, box.split(","))) if box else ROI(**meta["box"])
     det = DropDetector(ROIConfig(roi))
-    sd = det.det_orifice
+    sd = det.det_splash
     cap = cv2.VideoCapture(str(path))
     detected, signal, thresh = [], [], []
     for t in times:

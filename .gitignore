@@ -14,3 +14,10 @@ cspell.json
 
 # camera-specific detection box: each setup makes its own with --calibrate
 rois.json
+
+# Cartesia pronunciation dictionary id, created on first run
+.cartesia_dict.json
+
+# SQLite write-ahead log files next to driptwin_log.db
+driptwin_log.db-shm
+driptwin_log.db-wal

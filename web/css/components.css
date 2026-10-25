@@ -194,13 +194,12 @@ canvas { display: block; width: 100%; height: 240px; }
   border-bottom-right-radius: 6px;
 }
 .msg.bot { align-self: flex-start; background: var(--accent-soft); border-bottom-left-radius: 6px; }
-.msg .lat { display: block; margin-top: 4px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.msg .lat:empty { display: none; }
 
 #hfState { display: flex; align-items: center; gap: 10px; min-height: 22px; margin: 2px 0 12px; }
 #hfText { white-space: pre-line; }
 .meter { flex: none; width: 54px; height: 6px; overflow: hidden; border-radius: 3px; background: var(--line); }
 .meter i { display: block; width: 0; height: 100%; border-radius: 3px; background: var(--ok); transition: width .08s; }
+.hint { margin: 0 0 10px; text-align: center; font-size: 12px; color: var(--muted); }
 
 /* ---- controls ---- */
 input, button, select {
@@ -212,7 +211,7 @@ input, button, select {
   padding: 10px 12px;
 }
 input { flex: 1; min-width: 0; }
-input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
 button { cursor: pointer; font-weight: 700; transition: background .15s, border-color .15s, transform .1s; }
 button:hover { border-color: var(--accent); background: var(--accent-soft); }
 button:active { transform: scale(.98); }
@@ -231,12 +230,11 @@ button.primary:hover { background: linear-gradient(140deg, var(--accent), var(--
   font-size: 16px;
 }
 #ptt.rec { background: var(--alarm); box-shadow: 0 0 0 6px var(--alarm-soft); }
-.hint { margin: 0 0 10px; text-align: center; font-size: 12px; color: var(--muted); }
 .row { display: flex; gap: 8px; }
 .btns { display: flex; flex-wrap: wrap; gap: 8px; }
 label.check { display: flex; align-items: center; gap: 10px; padding: 6px 0; cursor: pointer; font-size: 14px; font-weight: 600; }
 label.check input { flex: none; width: 18px; height: 18px; accent-color: var(--accent); }
-label.check select { padding: 6px 10px; font-weight: 500; cursor: pointer; }
+label.check select { flex: 1; min-width: 0; padding: 6px 10px; font-weight: 600; cursor: pointer; }
 form.order { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 form.order label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; font-weight: 600; color: var(--muted); }
 form.order button { grid-column: span 2; }

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import json
 import os
 import re
-import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -45,6 +47,14 @@ def load_env(path: Path = ENV_FILE) -> None:
 ARGS = argparse.Namespace(sim=True, port=None, camera=0, head=None, monitor=False)
 rt: Runtime
 agent: Agent | None = None
+clients: set[asyncio.Queue] = set()      # open dashboards: alarm audio goes to all of them
+# Voice language from the dashboard: "en", "es", or "both" (alarms in English then
+# Spanish, answers in English).
+VOICE = {"lang": "en"}
+
+
+def reply_lang(setting: str) -> str:
+    return "es" if setting == "es" else "en"
 
 
 @asynccontextmanager
@@ -57,9 +67,14 @@ async def lifespan(app: FastAPI):
     elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
         agent = GeminiAgent(rt.twin, clock=rt.now, on_log=rt.log, lock=rt.lock)
     print(f"[agent] {agent.NAME if agent else 'none (no API key): scripted status replies'}")
-    task = asyncio.create_task(rt.run())
+    tasks = [asyncio.create_task(rt.run()), asyncio.create_task(alarm_speaker())]
+    if voice.available():
+        tasks.append(asyncio.create_task(voice.warm_up()))
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
+    if hasattr(rt.device, "close"):
+        rt.device.close()          # real valve: opened, firmware stopped
 
 
 app = FastAPI(lifespan=lifespan)
@@ -76,17 +91,19 @@ async def ws(sock: WebSocket):
     await sock.accept()
     q: asyncio.Queue = asyncio.Queue()
     rt.subscribers.add(q)
+    clients.add(q)
     try:
         await sock.send_json({"type": "hello", "agent": agent is not None,
                               "agent_name": agent.NAME if agent else "Claude",
                               "voice": voice.available(), "store": rt.store.kind,
-                              "sim": rt.sim, "monitor": rt.monitor})
+                              "sim": rt.sim, "monitor": rt.monitor, "lang": VOICE["lang"]})
         while True:
             await sock.send_json(await q.get())
     except WebSocketDisconnect:
         pass
     finally:
         rt.subscribers.discard(q)
+        clients.discard(q)
 
 
 @app.get("/video.mjpg")
@@ -114,31 +131,112 @@ def frame():
 
 class Say(BaseModel):
     text: str
-    lang: str = "en"
+    speak: bool = True
+    wake: bool = False      # hands-free: only answer if it starts with the wake word
+    lang: str | None = None
 
 
-def _lang(lang: str) -> str:
-    return lang if lang in voice.LANGUAGES else "en"
+def _line(obj: dict) -> bytes:
+    return (json.dumps(obj) + "\n").encode()
 
 
-async def _reply(text: str, lang: str) -> dict:
-    """Agent reply plus how long it took. Speech is fetched separately from
-    /api/speak, so the browser can start playing it while it streams."""
-    t = time.perf_counter()
-    if agent is None:
-        reply = offline_explain(rt.twin)
-    else:
+def _audio(pcm: bytes, **extra) -> dict:
+    return {"type": "audio", "pcm": base64.b64encode(pcm).decode(),
+            "rate": voice.SAMPLE_RATE, **extra}
+
+
+async def _answer(text: str, speak: bool, lang: str):
+    """NDJSON lines: text deltas and PCM audio as they're produced, then "done".
+    Claude's words go into Sonic as they're written, so speech starts before the
+    reply is finished. If streaming speech fails, the whole reply is sent as one
+    MP3; if that fails too, the browser speaks it with its own voice."""
+    loop = asyncio.get_running_loop()
+    deltas: asyncio.Queue = asyncio.Queue()
+    out: asyncio.Queue = asyncio.Queue()
+    ended = False
+
+    def on_text(t: str) -> None:            # called from the agent's worker thread
+        loop.call_soon_threadsafe(deltas.put_nowait, t)
+
+    async def run_agent() -> str:
         try:
-            reply = await asyncio.to_thread(agent.ask, text, lang)
+            if agent is None:
+                reply = offline_explain(rt.twin)
+                on_text(reply)
+                return reply
+            return await asyncio.to_thread(agent.ask, text, on_text, lang)
         except Exception as e:      # network / API failure must not break the device
-            reply = "I can't reach the assistant right now. " + offline_explain(rt.twin)
             print("[agent]", repr(e))
-    return {"reply": reply, "agent_ms": round((time.perf_counter() - t) * 1000)}
+            reply = "I can't reach the assistant right now. " + offline_explain(rt.twin)
+            on_text(reply)
+            return reply
+        finally:
+            loop.call_soon_threadsafe(deltas.put_nowait, None)
+
+    async def texts():
+        nonlocal ended
+        while not ended:
+            t = await deltas.get()
+            if t is None:
+                ended = True
+                return
+            out.put_nowait({"type": "text", "text": t})
+            yield t
+
+    async def speech() -> None:
+        spoken = False
+        try:
+            if speak and voice.available():
+                async for pcm in voice.stream_speech(texts(), lang):
+                    spoken = True
+                    out.put_nowait(_audio(pcm))
+        except Exception as e:
+            print("[tts] streaming failed:", repr(e))
+        async for _ in texts():             # no voice, or it failed: still stream the text
+            pass
+        reply = await agent_task
+        if speak and voice.available() and not spoken:
+            try:
+                mp3 = await voice.speak(reply, lang)
+                out.put_nowait({"type": "mp3", "audio_b64": base64.b64encode(mp3).decode()})
+                spoken = True
+            except Exception as e:
+                print("[tts]", repr(e))
+        out.put_nowait({"type": "done", "reply": reply, "spoken": spoken})
+        out.put_nowait(None)
+
+    agent_task = asyncio.create_task(run_agent())
+    speech_task = asyncio.create_task(speech())
+    try:
+        while (msg := await out.get()) is not None:
+            yield _line(msg)
+    finally:
+        speech_task.cancel()
+
+
+def _stream(lines) -> StreamingResponse:
+    return StreamingResponse(lines, media_type="application/x-ndjson")
+
+
+async def _just(*objs: dict):
+    for o in objs:
+        yield _line(o)
 
 
 @app.post("/api/ask")
 async def ask(body: Say):
-    return await _reply(body.text, _lang(body.lang))
+    text, lang = body.text, reply_lang(body.lang or VOICE["lang"])
+    if body.wake:
+        heard, question = split_wake(text)
+        if not heard:
+            print(f"[voice] heard {text!r}: ignored, no wake word")
+            return _stream(_just({"type": "ignored", "transcript": text}))
+        if not question:                  # just "assistant": the browser chimes and waits
+            print(f"[voice] heard {text!r}: wake word, waiting for the question")
+            return _stream(_just({"type": "wake", "transcript": text}))
+        text = question
+        print(f"[voice] heard {text!r}: asking the agent")
+    return _stream(_answer(text, body.speak, lang))
 
 
 # "assistant", "hey assistant", "Cartesia AI assistant", "oye asistente"... at the start of an
@@ -154,100 +252,128 @@ def split_wake(transcript: str) -> tuple[bool, str]:
 
 
 @app.post("/api/voice")
-async def voice_in(audio: UploadFile, wake: bool = Form(False), lang: str = Form("en")):
-    """Push-to-talk sends wake=false. Hands-free mode sends wake=true for every
-    utterance it hears, and only ones starting with the wake word reach the agent."""
+async def voice_in(audio: UploadFile, lang: str = Form("")):
+    """Push-to-talk: one recorded clip -> Ink-Whisper -> the agent, streamed back.
+    Hands-free listening doesn't come here: the browser streams to Ink 2 directly."""
     if not voice.available():
         return JSONResponse({"error": "CARTESIA_API_KEY not set"}, 400)
-    lang = _lang(lang)
-    t = time.perf_counter()
+    lang = reply_lang(lang or VOICE["lang"])
     try:
         transcript = await voice.transcribe(await audio.read(), audio.filename or "speech.webm", lang)
     except Exception as e:
         print(f"[voice] speech-to-text failed: {e!r}")
         return JSONResponse({"error": f"speech-to-text failed: {e}"}, 502)
-    stt_ms = round((time.perf_counter() - t) * 1000)
     if not transcript:
         print("[voice] heard nothing")
-        return {"transcript": "", "reply": ""}
-    if wake:
-        heard, question = split_wake(transcript)
-        if not heard:
-            print(f"[voice] heard {transcript!r}: ignored, no wake word")
-            return {"transcript": transcript, "ignored": True}
-        if not question:                  # just "assistant": the browser beeps and waits
-            print(f"[voice] heard {transcript!r}: wake word, waiting for the question")
-            return {"transcript": transcript, "wake": True, "reply": ""}
-        transcript = question
-    print(f"[voice] heard {transcript!r} ({lang}, {stt_ms} ms): asking the agent")
-    out = await _reply(transcript, lang)
-    print(f"[voice] reply {out['reply']!r} ({out['agent_ms']} ms)")
-    return {"transcript": transcript, "stt_ms": stt_ms, **out}
+        return _stream(_just({"type": "transcript", "text": ""}, {"type": "done", "reply": ""}))
+    print(f"[voice] heard {transcript!r}: asking the agent")
+
+    async def lines():
+        yield _line({"type": "transcript", "text": transcript})
+        async for line in _answer(transcript, True, lang):
+            yield line
+    return _stream(lines())
 
 
-async def _stream(text: str, lang: str, urgent: bool = False):
-    """Raw PCM straight from Cartesia. The first chunk is awaited here so a
-    failure is a clean 502 the browser can fall back from, not a cut-off stream."""
+@app.post("/api/stt-token")
+async def stt_token():
+    """Short-lived token for the browser's Ink 2 socket (the API key stays here)."""
     if not voice.available():
         return JSONResponse({"error": "CARTESIA_API_KEY not set"}, 400)
-    chunks = voice.speak_stream(text, lang, urgent)
     try:
-        first = await anext(chunks)
+        token = await voice.access_token()
     except Exception as e:
-        print("[tts]", repr(e))
-        return JSONResponse({"error": f"text-to-speech failed: {e}"}, 502)
+        print(f"[voice] access token failed: {e!r}")
+        return JSONResponse({"error": f"access token failed: {e}"}, 502)
+    return {"token": token, "version": voice.VERSION, "keyterms": voice.KEYTERMS}
 
-    async def body():
-        yield first
+
+class VoiceSettings(BaseModel):
+    lang: str
+
+
+@app.post("/api/voice-settings")
+def voice_settings(body: VoiceSettings):
+    if body.lang not in ("en", "es", "both"):
+        return JSONResponse({"error": "lang must be en, es or both"}, 400)
+    VOICE["lang"] = body.lang
+    return VOICE
+
+
+# ---- spoken alarms ---------------------------------------------------------------
+def _to_clients(msg: dict) -> None:
+    for q in list(clients):
+        q.put_nowait(msg)
+
+
+async def announce_alarm(kind: str, say: dict | None = None) -> None:
+    """Speak an alarm on every open dashboard, straight from the device event: no LLM
+    in the path, urgent voice, and in Spanish too if the dashboard asks for it."""
+    lines = voice.alarm_lines(kind, VOICE["lang"], say)
+    for i, (text, lang) in enumerate(lines):
+        clip = uuid.uuid4().hex
         try:
-            async for c in chunks:
-                yield c
+            if not voice.available():
+                raise RuntimeError("no CARTESIA_API_KEY")
+            first = True
+            async for pcm in voice.stream_speech(text, lang, style="alarm"):
+                _to_clients(_audio(pcm, alarm=True, clip=clip, first=first))
+                first = False
         except Exception as e:
-            print("[tts] stream cut off:", repr(e))
-    return StreamingResponse(body(), media_type="application/octet-stream",
-                             headers={"X-Sample-Rate": str(voice.SAMPLE_RATE),
-                                      "Cache-Control": "no-store"})
+            print(f"[alarm] streaming speech failed ({e!r}); browser voice instead")
+            _to_clients({"type": "alarm_say", "lines": lines[i:]})
+            return
 
 
-@app.post("/api/speak")
-async def speak(body: Say):
-    return await _stream(body.text, _lang(body.lang))
+async def alarm_speaker() -> None:
+    # Alarms are spoken one after another by a worker, so the state queue keeps
+    # draining while one is being said (runtime drops messages for full queues).
+    q: asyncio.Queue = asyncio.Queue()
+    kinds: asyncio.Queue = asyncio.Queue()
 
+    async def worker():
+        while True:
+            kind, say = await kinds.get()
+            try:
+                await announce_alarm(kind, say)
+            except Exception as err:
+                print("[alarm]", repr(err))
 
-# The only speech nobody asked for: real alarms, spoken the moment they fire. Short, says what
-# to do, never waits on the LLM. Warnings and notices stay on screen; "Assistant, what
-# happened?" gets the details.
-ANNOUNCE = {
-    "occlusion": ("Alarm. No flow. The line may be kinked or clamped. Check the tubing and the IV site.",
-                  "Alarma. No hay flujo. La vía puede estar doblada o pinzada. Revise el tubo y el sitio de la vía."),
-    "free_flow": ("Alarm. Free flow. The valve is closed. Check the tubing is seated in the clamp.",
-                  "Alarma. Flujo libre. La válvula está cerrada. Revise que el tubo esté bien puesto en la pinza."),
-    "empty_bag": ("Alarm. The bag looks empty. The valve is closed. Replace the bag.",
-                  "Alarma. La bolsa parece vacía. La válvula está cerrada. Cambie la bolsa."),
-    "fw_host_lost": ("Alarm. The clamp controller lost contact and is holding its position. Check the line by hand.",
-                     "Alarma. El controlador de la pinza perdió la conexión y mantiene su posición. Revise la vía a mano."),
-}
-
-
-class Announce(BaseModel):
-    kind: str
-    lang: str = "en"
-
-
-@app.post("/api/announce")
-async def announce(body: Announce):
-    phrases = ANNOUNCE.get(body.kind)
-    if phrases is None:
-        return Response(status_code=204)     # not an alarm: stays silent
-    lang = _lang(body.lang)
-    return await _stream(phrases[lang == "es"], lang, urgent=True)
+    rt.subscribers.add(q)
+    task = asyncio.create_task(worker())
+    try:
+        while True:
+            msg = await q.get()
+            for e in msg.get("events", []):
+                say = (e.get("data") or {}).get("say")
+                if e["severity"] == "alarm" or say:     # warnings with their own words too
+                    kinds.put_nowait((e["kind"], say))
+    finally:
+        task.cancel()
+        rt.subscribers.discard(q)
 
 
 class OrderIn(BaseModel):
     rate_ml_h: float
+    drop_factor: int
     vtbi_ml: float
     bag_volume_ml: float
     drug: str = "fluid"
+
+
+@app.get("/api/history")
+def history(minutes: int = 30):
+    """Flow history, no-drop gaps and time to empty from the Tiger Data aggregates
+    (read-only agent role). 503 when Timescale isn't configured."""
+    from . import timeseries
+    q = timeseries.queries()
+    if not q.available:
+        return JSONResponse({"error": "no AGENT_DATABASE_URL: history needs Tiger Data"}, 503)
+    try:
+        return {"flow": q.flow_history(minutes), "gaps": q.flow_gaps(min(minutes, 60)),
+                "time_to_empty": q.time_to_empty()}
+    except LookupError as e:
+        return JSONResponse({"error": str(e)}, 404)
 
 
 @app.post("/api/order")

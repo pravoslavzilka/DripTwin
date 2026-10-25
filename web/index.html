@@ -75,9 +75,15 @@
         <svg width="16" height="20" viewBox="0 0 16 20" aria-hidden="true"><rect x="4" y="1" width="8" height="12" rx="4" fill="currentColor"/><path d="M1.5 9.5a6.5 6.5 0 0 0 13 0M8 16v3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
         <span id="pttLabel">Hold to talk</span>
       </button>
-      <p class="hint">or hold the space bar. Or just say “Assistant”</p>
-      <label class="check">Language
-        <select id="lang"><option value="en">English</option><option value="es">Español</option></select></label>
+      <p class="hint">or hold the space bar</p>
+      <label class="check"><input type="checkbox" id="handsFree" checked> Hands-free listening</label>
+      <label class="check"><input type="checkbox" id="needWake" checked> Only answer after “Assistant”</label>
+      <label class="check">Voice
+        <select id="voiceLang">
+          <option value="en">English</option>
+          <option value="es">Español</option>
+          <option value="both">English, alarms also in Spanish</option>
+        </select></label>
       <div id="hfState" class="muted"><span class="meter" id="hfMeter" hidden><i></i></span><span id="hfText"></span></div>
       <div id="chat"></div>
       <form class="row" id="askForm">
@@ -106,6 +112,7 @@
       <h2>Start an infusion</h2>
       <form class="order" id="orderForm">
         <label>Rate (mL/hour)<input name="rate_ml_h" type="number" value="120" step="any"></label>
+        <label>Drip set (drops/mL)<input name="drop_factor" type="number" value="20"></label>
         <label>Volume to give (mL)<input name="vtbi_ml" type="number" value="1000" step="any"></label>
         <label>Bag size (mL)<input name="bag_volume_ml" type="number" value="1000" step="any"></label>
         <button class="primary">Start infusion</button>
@@ -122,10 +129,6 @@
 const $ = (id) => document.getElementById(id);
 const hist = [];
 let hello = {}, alarmText = "";
-// English or Spanish: sets what Cartesia listens for, what Claude answers in and how it's spoken.
-const lang = () => $("lang").value;
-try { $("lang").value = localStorage.getItem("lang") || "en"; } catch (e) {}
-$("lang").onchange = () => { try { localStorage.setItem("lang", lang()); } catch (e) {} };
 
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
@@ -151,10 +154,17 @@ function connect() {
       $("simPanel").style.display = msg.sim ? "" : "none";
       document.querySelectorAll(".simonly").forEach(el => el.style.display = msg.sim ? "" : "none");
       if (msg.monitor) setupMonitor();
-      handsFreeStart();                        // always listening for "Assistant", from page load
+      if (msg.lang) $("voiceLang").value = msg.lang;
+      if ($("handsFree").checked && !hf.on) handsFreeStart();      // hands-free from page load
     } else if (msg.type === "state") {
       render(msg.state);
       msg.events.forEach(addEvent);
+    } else if (msg.type === "audio" && msg.alarm) {    // spoken alarm, streamed by the server
+      if (msg.first) interruptForAlarm();
+      playPcm(msg.pcm, msg.rate, true);
+    } else if (msg.type === "alarm_say") {             // no Cartesia: the browser's own voice
+      interruptForAlarm();
+      msg.lines.forEach(([text, lang]) => speakLocal(text, lang));
     }
   };
   ws.onclose = () => { $("mode").className = "pill"; $("mode").textContent = "Reconnecting…"; setTimeout(connect, 1000); };
@@ -165,7 +175,7 @@ function setupMonitor() {
   document.querySelectorAll(".ctl").forEach(el => el.style.display = "none");
   $("lTarget").textContent = "Drops counted";
   $("lMlh").textContent = "Last drop";
-  $("lValve").textContent = "Camera";
+  $("lValve").textContent = "Flow";
   $("chartTitle").textContent = "Drip rate over time";
   $("askText").placeholder = "“How fast is it dripping?”";
 }
@@ -191,7 +201,7 @@ function renderMonitor(s) {
   set("rate", s.rate_gtt_min.toFixed(1), "drops/min");
   set("target", s.drops_counted, "drops");
   set("mlh", age != null ? age.toFixed(0) : "–", "sec ago");
-  set("valve", d.camera_ok ? "On" : "Off", "");
+  set("valve", s.rate_ml_h != null ? s.rate_ml_h.toFixed(0) : "–", `mL/hour · ${s.infused_ml.toFixed(0)} mL so far`);
   if (d.camera_error) {
     if ($("banner").style.display !== "block") console.warn("camera:", d.camera_error);
     $("banner").textContent = "Can't see the camera. Check that it's plugged in and pointed at the drip chamber.";
@@ -280,13 +290,11 @@ function addEvent(e) {
   if (e.severity === "alarm") {
     $("banner").textContent = e.message; $("banner").style.display = "block";
   }
-  // The only speech nobody asked for: real alarms (blocked line, free flow, empty bag, lost
-  // controller). Everything else is shown, never spoken.
-  if (e.severity === "alarm") speakStream("/api/announce", { kind: e.kind, lang: lang() });
+  // Alarms are spoken by the server (see "audio" in connect()); other events are only shown.
 }
 
 // ---- audio ----
-let speaking = Promise.resolve(), audioBusy = 0;   // audioBusy > 0 while anything is queued or playing
+let speaking = Promise.resolve(), audioBusy = 0;   // audioBusy > 0 while an MP3 or browser voice is queued or playing
 function queueAudio(run) {
   audioBusy++;
   speaking = speaking.then(() => new Promise(run)).then(() => { audioBusy--; });
@@ -299,46 +307,54 @@ function unlockAudio() {
   if (hf.ctx && hf.ctx.state === "suspended") hf.ctx.resume().catch(() => {});
 }
 addEventListener("pointerdown", unlockAudio); addEventListener("keydown", unlockAudio);
-// Cartesia speech arrives as a stream of raw 16-bit PCM. Each piece is scheduled the moment it
-// lands, so playback starts ~0.2 s after the request instead of after the whole reply.
-// onFirst(ms) reports how long the first sound took. Falls back to the browser's own voice.
-function speakStream(url, body, onFirst) {
+function play(b64) {
   queueAudio(async (res) => {
     try {
       unlockAudio();
-      const t0 = performance.now();
-      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
-                                   body: JSON.stringify(body) });
-      if (r.status === 204) return res();
-      if (!r.ok) throw new Error("speech " + r.status);
-      if (actx.state === "suspended") hf.last = "\nTap the page once to turn on sound.";
-      const rate = +r.headers.get("X-Sample-Rate") || 24000, reader = r.body.getReader();
-      let at = 0, carry = null;
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        let bytes = value;
-        if (carry) { bytes = new Uint8Array(carry.length + value.length); bytes.set(carry); bytes.set(value, carry.length); }
-        const n = bytes.length >> 1;                 // a chunk can split a sample: keep the odd byte
-        carry = bytes.length & 1 ? bytes.slice(-1) : null;
-        if (!n) continue;
-        const pcm = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
-        const buf = actx.createBuffer(1, n, rate), ch = buf.getChannelData(0);
-        for (let i = 0; i < n; i++) ch[i] = pcm.getInt16(i * 2, true) / 32768;
-        const src = actx.createBufferSource(); src.buffer = buf; src.connect(actx.destination);
-        if (!at && onFirst) onFirst(performance.now() - t0);
-        at = Math.max(at, actx.currentTime + 0.03);
-        src.start(at); at += buf.duration;
-      }
-      setTimeout(res, Math.max(0, (at - actx.currentTime) * 1000));
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const src = actx.createBufferSource();
+      src.buffer = await actx.decodeAudioData(bytes.buffer);
+      src.connect(actx.destination); src.onended = res; src.start();
     } catch (e) {
-      console.warn(e);
-      if (!body.text) return res();
-      const u = new SpeechSynthesisUtterance(body.text);
-      u.lang = body.lang === "es" ? "es-MX" : "en-US"; u.onend = res; u.onerror = res; speechSynthesis.speak(u);
+      const a = new Audio("data:audio/mpeg;base64," + b64); a.onended = res; a.onerror = res;
+      a.play().catch(() => { hf.last = "\nTap the page once to turn on sound."; res(); });
     }
   });
 }
+const voiceLang = () => $("voiceLang").value;
+function speakLocal(text, lang) {
+  queueAudio((res) => {
+    const u = new SpeechSynthesisUtterance(text); u.onend = res; u.onerror = res;
+    u.lang = (lang || (voiceLang() === "es" ? "es" : "en")) === "es" ? "es-ES" : "en-US";
+    speechSynthesis.speak(u);
+  });
+}
+
+// Streamed speech: 16-bit PCM chunks scheduled back to back as they arrive, so a reply
+// starts playing while the rest is still being generated.
+const pcm = { next: 0, alarmEnd: 0, sources: new Set() };
+let replyGen = 0;                  // bumped by an alarm: drops the rest of the reply it cut off
+function playPcm(b64, rate, alarm) {
+  unlockAudio();
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const view = new DataView(bytes.buffer), n = bytes.length >> 1, f = new Float32Array(n);
+  for (let i = 0; i < n; i++) f[i] = view.getInt16(i * 2, true) / 32768;
+  const buf = actx.createBuffer(1, n, rate); buf.copyToChannel(f, 0);
+  const src = actx.createBufferSource(); src.buffer = buf; src.alarm = !!alarm;
+  src.connect(actx.destination);
+  const t = Math.max(actx.currentTime + 0.03, pcm.next);
+  src.start(t); pcm.next = t + buf.duration;
+  if (alarm) pcm.alarmEnd = pcm.next;
+  pcm.sources.add(src); src.onended = () => pcm.sources.delete(src);
+}
+// An alarm cuts off whatever the assistant was saying, but never another alarm.
+function interruptForAlarm() {
+  replyGen++;
+  for (const s of pcm.sources) if (!s.alarm) { try { s.stop(); } catch (e) {} pcm.sources.delete(s); }
+  pcm.next = actx ? Math.max(actx.currentTime, pcm.alarmEnd) : 0;
+  speechSynthesis.cancel();
+}
+const isSpeaking = () => (actx && actx.currentTime < pcm.next) || audioBusy > 0 || speechSynthesis.speaking;
 
 async function post(url, body) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
@@ -346,36 +362,63 @@ async function post(url, body) {
   return r.json();
 }
 
+function msgEl(who, text) {
+  const d = document.createElement("div"); d.className = "msg " + who; d.textContent = text; return d;
+}
 function chat(who, text) {
-  const d = document.createElement("div"); d.className = "msg " + who; d.textContent = text;
-  $("chat").append(d); $("chat").scrollTop = 1e9; return d;
+  const d = msgEl(who, text); $("chat").append(d); $("chat").scrollTop = 1e9; return d;
 }
 
-// Under each reply: how long each stage took, so the speed is visible. Only spoken questions
-// ("Assistant, …" or the talk button) get a spoken answer; typed ones are answered on screen.
-async function handleReply(r, speak = true) {
-  if (r.error) { console.warn(r.error); return chat("bot", "Sorry, that didn't work. Please try again."); }
-  if (!r.reply) return;
-  const d = chat("bot", r.reply), lat = document.createElement("small");
-  lat.className = "lat"; d.append(lat);
-  const sec = (ms) => (ms / 1000).toFixed(ms < 1000 ? 2 : 1) + " s";
-  const parts = [r.stt_ms != null && "heard in " + sec(r.stt_ms), "answered in " + sec(r.agent_ms)].filter(Boolean);
-  lat.textContent = parts.join(" · ");
-  if (!speak) return;
-  speakStream("/api/speak", { text: r.reply, lang: lang() },
-              (ms) => { lat.textContent = [...parts, "voice in " + sec(ms)].join(" · "); });
+// Read a streamed reply (one JSON object per line): text and audio as they arrive, then
+// "done". `bubble` is the "…" placeholder to fill; `before` runs just before the first bot
+// text appears; other message types (transcript, wake, ignored) go to onMeta.
+async function streamReply(resp, { bubble = null, before = () => {}, onMeta = () => {} } = {}) {
+  if (!resp.ok) {
+    let err = ""; try { err = (await resp.json()).error; } catch (e) {}
+    console.warn(err); bubble?.remove();
+    return chat("bot", "Sorry, that didn't work. Please try again.");
+  }
+  const gen = replyGen;
+  let text = "";
+  const bot = () => { if (!bubble) { before(); bubble = chat("bot", "…"); } return bubble; };
+  const handle = (m) => {
+    if (m.type === "text") { text += m.text; bot().textContent = text.trim() || "…"; $("chat").scrollTop = 1e9; }
+    else if (m.type === "audio") { if (gen === replyGen) playPcm(m.pcm, m.rate); }
+    else if (m.type === "mp3") { if (gen === replyGen) play(m.audio_b64); }
+    else if (m.type === "done") {
+      if (m.reply) { bot().textContent = m.reply; if (!m.spoken && gen === replyGen) speakLocal(m.reply); }
+      else if (!text) bubble?.remove();
+    } else onMeta(m);
+  };
+  const reader = resp.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (line.trim()) handle(JSON.parse(line));
+    }
+  }
+  if (buf.trim()) handle(JSON.parse(buf));
+}
+
+function askJSON(body) {
+  return fetch("/api/ask", { method: "POST", headers: { "Content-Type": "application/json" },
+                             body: JSON.stringify({ speak: true, lang: voiceLang(), ...body }) });
 }
 
 $("askForm").onsubmit = async (ev) => {
   ev.preventDefault();
   const text = $("askText").value.trim(); if (!text) return;
   $("askText").value = ""; chat("you", text);
-  const thinking = chat("bot", "…");
-  const r = await post("/api/ask", { text, lang: lang() }); thinking.remove(); handleReply(r, false);
+  try { await streamReply(await askJSON({ text }), { bubble: chat("bot", "…") }); }
+  catch (e) { chat("bot", "Connection lost. Please try again."); }
 };
 
-// push-to-talk: MediaRecorder -> /api/voice (Cartesia STT -> Claude -> Cartesia TTS).
-// Holding the button is itself the call, so no wake word is needed here.
+// push-to-talk fallback (noisy rooms): MediaRecorder -> /api/voice (Ink-Whisper -> Claude -> Sonic)
 let rec, chunks = [];
 // Safari records mp4, Chrome/Firefox webm: name the file after what was actually recorded.
 const audioName = (type) => "speech." + (type.includes("mp4") ? "mp4" : type.includes("ogg") ? "ogg" : "webm");
@@ -383,17 +426,20 @@ async function startRec() {
   if (rec && rec.state === "recording") return;
   if (!hello.voice) { $("askText").focus(); $("askText").placeholder = "Voice isn't available. Type your question"; return; }
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  rec = new MediaRecorder(stream); chunks = [];
+  rec = new MediaRecorder(stream); chunks = []; hf.ptt = true;
   rec.ondataavailable = (e) => chunks.push(e.data);
   rec.onstop = async () => {
-    stream.getTracks().forEach(t => t.stop());
-    const fd = new FormData(); fd.append("audio", new Blob(chunks, { type: rec.mimeType }), audioName(rec.mimeType));
-    fd.append("lang", lang());
+    stream.getTracks().forEach(t => t.stop()); hf.ptt = false;
+    const fd = new FormData();
+    fd.append("audio", new Blob(chunks, { type: rec.mimeType }), audioName(rec.mimeType));
+    fd.append("lang", voiceLang());
     const thinking = chat("bot", "…");
-    const r = await (await fetch("/api/voice", { method: "POST", body: fd })).json();
-    thinking.remove();
-    if (r.transcript) chat("you", r.transcript);
-    handleReply(r);
+    try {
+      await streamReply(await fetch("/api/voice", { method: "POST", body: fd }), {
+        bubble: thinking,
+        onMeta: (m) => { if (m.type === "transcript" && m.text) thinking.before(msgEl("you", m.text)); },
+      });
+    } catch (e) { thinking.textContent = "Connection lost. Please try again."; }
   };
   rec.start(); $("ptt").classList.add("rec"); $("pttLabel").textContent = "Listening… let go to send";
 }
@@ -402,109 +448,140 @@ function stopRec() {
   $("ptt").classList.remove("rec"); $("pttLabel").textContent = "Hold to talk";
 }
 $("ptt").onpointerdown = startRec; $("ptt").onpointerup = stopRec; $("ptt").onpointerleave = stopRec;
-addEventListener("keydown", (e) => { if (e.code === "Space" && document.activeElement.tagName !== "INPUT" && !e.repeat) { e.preventDefault(); startRec(); } });
-addEventListener("keyup", (e) => { if (e.code === "Space" && document.activeElement.tagName !== "INPUT") stopRec(); });
 
-// Hands-free is always on (no off switch), alongside the talk button. A volume-based
-// speech detector cuts the mic into utterances; each one goes to /api/voice with wake=true, and
-// the server only passes ones starting with "assistant" to the agent. Saying just "assistant"
-// arms the next utterance (10 s) as the question. If the mic is blocked or drops out, it keeps
-// retrying on its own.
-const hf = { on: false, armedUntil: 0, inflight: 0, rec: null, last: "", queue: Promise.resolve() };
-const HF_TEXT = {
-  en: { listening: "Listening…", armed: "Go ahead, I'm listening…", thinking: "Thinking…",
-        speaking: "Speaking…", idle: "Say “Assistant” to ask a question" },
-  es: { listening: "Escuchando…", armed: "Adelante, le escucho…", thinking: "Pensando…",
-        speaking: "Hablando…", idle: "Diga “Asistente” para preguntar" },
-};
+// hands-free: the microphone streams to Cartesia Ink 2, whose turn detection decides when
+// the nurse has finished speaking (no button, no silence timer). Each finished turn goes to
+// /api/ask; with "Only answer after 'Assistant'" ticked, the server ignores turns that don't
+// start with the wake word. Saying just "assistant" arms the next turn (10 s) as the question.
+// While DripTwin itself is talking, silence is sent instead of the mic so it can't hear itself.
+const WORKLET = `
+class Pcm16k extends AudioWorkletProcessor {
+  constructor() { super(); this.step = sampleRate / 16000; this.pos = 0; this.sum = 0; this.cnt = 0;
+                  this.out = new Int16Array(1600); this.n = 0; this.sq = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.sum += ch[i]; this.cnt++;
+      if (++this.pos >= this.step) {           // average down to 16 kHz
+        this.pos -= this.step;
+        const v = Math.max(-1, Math.min(1, this.sum / this.cnt)); this.sum = 0; this.cnt = 0;
+        this.out[this.n++] = v * 32767; this.sq += v * v;
+        if (this.n === this.out.length) {      // 100 ms per message
+          this.port.postMessage({ pcm: this.out.buffer.slice(0), rms: Math.sqrt(this.sq / this.n) });
+          this.n = 0; this.sq = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("pcm16k", Pcm16k);`;
+const SILENCE = new Int16Array(1600).buffer;
+const hf = { on: false, ws: null, armedUntil: 0, inflight: 0, last: "", partial: "", hearing: false,
+             level: 0, ptt: false, queue: Promise.resolve() };
 function hfShow(text, level) {
   $("hfText").textContent = text;
   $("hfMeter").hidden = level == null;
   if (level != null) $("hfMeter").firstChild.style.width = Math.min(100, level * 100) + "%";
 }
 async function handsFreeStart() {
-  if (hf.on) return;
-  if (!hello.voice) { hfShow("Voice isn't available. You can type your question below."); return; }
+  if (!hello.voice) {
+    $("handsFree").checked = false;
+    hfShow("Voice isn't available. You can type your question below."); return;
+  }
   hf.on = true;                    // set first: a WebSocket reconnect must not start a second one
   try {
     hf.stream = await navigator.mediaDevices.getUserMedia(
-      { audio: { echoCancellation: true, noiseSuppression: true } });
+      { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
   } catch (e) {
-    hf.on = false;
-    hfShow("The microphone is blocked. Allow it for this page and listening starts on its own.");
-    setTimeout(handsFreeStart, 3000); return;
+    hf.on = false; $("handsFree").checked = false;
+    hfShow("The microphone is blocked. Allow it in the browser, then tick the box again."); return;
   }
-  // mic unplugged or taken away: start over
-  hf.stream.getAudioTracks().forEach(t => t.onended = () => { handsFreeStop(); setTimeout(handsFreeStart, 1000); });
   hf.ctx = new AudioContext();     // starts suspended on page load until the first click (browser rule)
-  hf.an = hf.ctx.createAnalyser(); hf.an.fftSize = 1024;
-  hf.ctx.createMediaStreamSource(hf.stream).connect(hf.an);
-  hf.buf = new Float32Array(hf.an.fftSize);
-  hf.floor = 0.01;
-  hf.timer = setInterval(hfTick, 50);
+  await hf.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
+  hf.node = new AudioWorkletNode(hf.ctx, "pcm16k");
+  const mute = hf.ctx.createGain(); mute.gain.value = 0;   // keeps the node pulled without playing the mic
+  hf.ctx.createMediaStreamSource(hf.stream).connect(hf.node).connect(mute).connect(hf.ctx.destination);
+  hf.node.port.onmessage = (e) => {
+    hf.level = e.data.rms;
+    const ws = hf.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(isSpeaking() || hf.ptt ? SILENCE : e.data.pcm);
+  };
+  hf.timer = setInterval(hfStatus, 150);
   unlockAudio();
+  hfConnect();
 }
 function handsFreeStop() {
   hf.on = false; clearInterval(hf.timer);
-  if (hf.rec && hf.rec.state === "recording") { hf.rec.discard = true; hf.rec.stop(); }
+  if (hf.ws) { const ws = hf.ws; hf.ws = null; try { ws.close(); } catch (e) {} }
   if (hf.stream) hf.stream.getTracks().forEach(t => t.stop());
   if (hf.ctx) hf.ctx.close();
   hfShow("");
 }
-function hfTick() {
-  if (hf.ctx.state === "suspended") {
-    hf.ctx.resume().catch(() => {});           // allowed by some browsers once the mic is live
-    hfShow("Tap anywhere on the page to start listening."); return;
+async function hfConnect() {
+  if (!hf.on || hf.ws) return;
+  let tok;
+  try {
+    const r = await fetch("/api/stt-token", { method: "POST" });
+    tok = await r.json();
+    if (!r.ok) throw new Error(tok.error);
+  } catch (e) {
+    console.warn("stt token:", e);
+    hf.last = "\nCan't reach the voice service. Retrying… (hold to talk still works)";
+    setTimeout(hfConnect, 5000); return;
   }
-  hf.an.getFloatTimeDomainData(hf.buf);
-  let sum = 0; for (const v of hf.buf) sum += v * v;
-  const rms = Math.sqrt(sum / hf.buf.length), now = performance.now();
-  const threshold = Math.max(hf.floor * 3, 0.015);
-  const talking = audioBusy > 0 || speechSynthesis.speaking;      // don't listen to ourselves
-  const recording = hf.rec && hf.rec.state === "recording";
-  const T = HF_TEXT[lang()];
-  const state = recording ? T.listening : now < hf.armedUntil ? T.armed
-    : hf.inflight ? T.thinking : talking ? T.speaking : T.idle;
-  hfShow(state + hf.last, rms / threshold / 3);                   // meter full at 3x the trigger level
-  if (recording) {
-    if (talking) { hf.rec.discard = true; hf.rec.stop(); return; }
-    if (rms > threshold) hf.tLoud = now;
-    if (now - hf.tLoud > 900 || now - hf.t0 > 12000) {          // 0.9 s of silence ends it
-      hf.rec.short = hf.tLoud - hf.t0 < 350; hf.rec.stop();
-    }
-  } else if (!talking && !(rec && rec.state === "recording")) {   // the talk button has the mic
-    if (rms > threshold) { hfRecord(); hf.t0 = hf.tLoud = now; }
-    else hf.floor = hf.floor * 0.98 + rms * 0.02;              // learn the room's noise level
-  }
-}
-function hfRecord() {
-  const r = new MediaRecorder(hf.stream), chunks = [];
-  r.ondataavailable = (e) => chunks.push(e.data);
-  // Sent one at a time: after "assistant… <pause> …how many drops?", the question must wait
-  // for the wake reply to arm it, or it goes out with wake=true and is ignored.
-  r.onstop = () => {
-    if (r.discard || r.short) return;
-    const blob = new Blob(chunks, { type: r.mimeType });
-    hf.queue = hf.queue.then(() => hfSend(blob));
+  if (!hf.on) return;
+  const q = new URLSearchParams({ model: "ink-2", encoding: "pcm_s16le", sample_rate: "16000",
+    cartesia_version: tok.version, access_token: tok.token,
+    turn_end_threshold: "0.4", turn_end_timeout_ms: "3000" });   // answer a little sooner than the default
+  tok.keyterms.forEach(k => q.append("keyterm", k));
+  const ws = new WebSocket("wss://api.cartesia.ai/stt/turns/websocket?" + q);
+  ws.binaryType = "arraybuffer"; hf.ws = ws;
+  ws.onopen = () => { hf.last = ""; };
+  ws.onmessage = (m) => hfEvent(JSON.parse(m.data));
+  ws.onclose = (e) => {
+    if (hf.ws !== ws) return;
+    hf.ws = null; hf.hearing = false;
+    console.warn("Ink 2 socket closed", e.code, e.reason);
+    if (hf.on) setTimeout(hfConnect, 1000);      // tokens expire; a fresh one per connection
   };
-  r.start(); hf.rec = r;
 }
-async function hfSend(blob) {
+function hfEvent(m) {
+  if (m.type === "turn.start") { hf.hearing = true; hf.partial = ""; }
+  else if (m.type === "turn.update" || m.type === "turn.eager_end") hf.partial = m.transcript || "";
+  else if (m.type === "turn.end") {
+    hf.hearing = false; hf.partial = "";
+    const text = (m.transcript || "").trim();
+    // One at a time: after "assistant… <pause> …how many drops?", the question must wait
+    // for the wake reply to arm it, or it goes out with wake=true and is ignored.
+    if (text) hf.queue = hf.queue.then(() => hfSend(text));
+  } else if (m.type === "error") { console.warn("Ink 2:", m); hf.last = "\n" + (m.message || "Voice error"); }
+  hfStatus();
+}
+function hfStatus() {
+  if (!hf.on) return;
+  if (hf.ctx.state === "suspended") { hfShow("Tap anywhere on the page to start listening."); return; }
+  const wakeNeeded = $("needWake").checked && performance.now() >= hf.armedUntil;
+  const state = !hf.ws ? "Connecting…"
+    : hf.hearing ? (hf.partial ? `“${hf.partial}”` : "Listening…")
+    : performance.now() < hf.armedUntil ? "Go ahead, I'm listening…"
+    : hf.inflight ? "Thinking…" : isSpeaking() ? "Speaking…"
+    : wakeNeeded ? "Say “Assistant” to ask a question" : "Listening. Just speak.";
+  hfShow(state + hf.last, isSpeaking() ? 0 : hf.level * 8);
+}
+async function hfSend(text) {
   const armed = performance.now() < hf.armedUntil;
-  const fd = new FormData();
-  fd.append("audio", blob, audioName(blob.type)); fd.append("wake", armed ? "false" : "true");
-  fd.append("lang", lang());
   hf.inflight++;
   try {
-    const r = await (await fetch("/api/voice", { method: "POST", body: fd })).json();
-    if (r.error) { console.warn(r.error); hf.last = "\nSorry, that didn't work. Please try again."; return; }
-    if (!r.transcript) { hf.last = "\nDidn't catch that."; return; }
-    if (r.ignored) { hf.last = `\nHeard “${r.transcript}”. Start with “Assistant”.`; return; }
-    hf.last = "";
-    chat("you", r.transcript);
-    if (r.wake) { hf.armedUntil = performance.now() + 10000; chime(); return; }
-    hf.armedUntil = 0;
-    handleReply(r);
+    const resp = await askJSON({ text, wake: $("needWake").checked && !armed });
+    await streamReply(resp, {
+      before: () => { hf.last = ""; hf.armedUntil = 0; chat("you", text); },
+      onMeta: (m) => {
+        if (m.type === "ignored") hf.last = `\nHeard “${m.transcript}”. Start with “Assistant”.`;
+        else if (m.type === "wake") { hf.last = ""; chat("you", m.transcript); hf.armedUntil = performance.now() + 10000; chime(); }
+      },
+    });
   } catch (e) {
     hf.last = "\nConnection lost. Reconnecting…";
   } finally { hf.inflight--; }
@@ -520,12 +597,16 @@ function chime() {
     });
   } catch (e) {}
 }
+$("handsFree").onchange = (e) => e.target.checked ? handsFreeStart() : handsFreeStop();
+$("voiceLang").onchange = () => post("/api/voice-settings", { lang: voiceLang() });
+addEventListener("keydown", (e) => { if (e.code === "Space" && !["INPUT", "SELECT"].includes(document.activeElement.tagName) && !e.repeat) { e.preventDefault(); startRec(); } });
+addEventListener("keyup", (e) => { if (e.code === "Space" && !["INPUT", "SELECT"].includes(document.activeElement.tagName)) stopRec(); });
 
 document.querySelectorAll("[data-sim]").forEach(b => b.onclick = () => post("/api/sim/" + b.dataset.sim));
 $("orderForm").onsubmit = async (ev) => {
   ev.preventDefault();
   const f = Object.fromEntries(new FormData(ev.target));
-  const body = { rate_ml_h: +f.rate_ml_h, vtbi_ml: +f.vtbi_ml, bag_volume_ml: +f.bag_volume_ml };
+  const body = { rate_ml_h: +f.rate_ml_h, drop_factor: +f.drop_factor, vtbi_ml: +f.vtbi_ml, bag_volume_ml: +f.bag_volume_ml };
   const r = await post("/api/order", body); if (r.error) alert(r.error);
 };
 $("pause").onclick = () => post("/api/pause");

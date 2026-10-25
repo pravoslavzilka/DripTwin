@@ -1,0 +1,119 @@
+{
+ "note": "re-measured with the fixed counter, bag raised: closing from 40 deg; flow drifts +-15 % on its own; cut-off between 67 and 70 deg; 40 deg frees a squashed tube",
+ "head_cm": null,
+ "drop_factor": 20,
+ "measured": "2026-10-25 13:55",
+ "open_deg": 40,
+ "closed_deg": 90,
+ "backlash_deg": 1.5,
+ "settle_s": 8.0,
+ "rate_window": 16,
+ "rows": [
+  {
+   "angle": 40.0,
+   "gtt_min": 166.41,
+   "drops": 40,
+   "secs": 14.4,
+   "ml_h": 761.3
+  },
+  {
+   "angle": 55.0,
+   "gtt_min": 161.86,
+   "drops": 40,
+   "secs": 14.8,
+   "ml_h": 733.9
+  },
+  {
+   "angle": 60.0,
+   "gtt_min": 98.21,
+   "drops": 40,
+   "secs": 24.4,
+   "ml_h": 390.9
+  },
+  {
+   "angle": 62.0,
+   "gtt_min": 95.05,
+   "drops": 40,
+   "secs": 25.2,
+   "ml_h": 376.5
+  },
+  {
+   "angle": 63.0,
+   "gtt_min": 92.86,
+   "drops": 40,
+   "secs": 25.8,
+   "ml_h": 366.6
+  },
+  {
+   "angle": 64.0,
+   "gtt_min": 90.73,
+   "drops": 40,
+   "secs": 26.5,
+   "ml_h": 357.2
+  },
+  {
+   "angle": 64.5,
+   "gtt_min": 88.13,
+   "drops": 40,
+   "secs": 27.2,
+   "ml_h": 345.7
+  },
+  {
+   "angle": 65.0,
+   "gtt_min": 88.79,
+   "drops": 40,
+   "secs": 27.0,
+   "ml_h": 348.6
+  },
+  {
+   "angle": 65.5,
+   "gtt_min": 90.78,
+   "drops": 40,
+   "secs": 26.4,
+   "ml_h": 357.4
+  },
+  {
+   "angle": 66.0,
+   "gtt_min": 114.03,
+   "drops": 40,
+   "secs": 21.0,
+   "ml_h": 466.9
+  },
+  {
+   "angle": 66.5,
+   "gtt_min": 122.2,
+   "drops": 40,
+   "secs": 19.6,
+   "ml_h": 508.8
+  },
+  {
+   "angle": 67.0,
+   "gtt_min": 98.21,
+   "drops": 40,
+   "secs": 24.4,
+   "ml_h": 390.8
+  },
+  {
+   "angle": 68.0,
+   "gtt_min": 39.92,
+   "drops": 20,
+   "secs": 30.1,
+   "ml_h": 152.1
+  },
+  {
+   "angle": 70.0,
+   "gtt_min": 35.92,
+   "drops": 18,
+   "secs": 30.1,
+   "ml_h": 136.8
+  },
+  {
+   "angle": 90.0,
+   "gtt_min": 0.0,
+   "ml_h": 0.0
+  }
+ ],
+ "stall_s": 25.0,
+ "head_alert_cm": 30.0,
+ "step_deg": 0.5
+}

@@ -24,8 +24,10 @@ from machine import Pin, PWM, WDT
 U_MIN, U_MAX = 0.0, 1.0
 MAX_SLEW_PER_S = 0.15
 HB_TIMEOUT_MS = 3000
-# servo calibration: pulse width at fully open / fully pinched (tune per build)
-OPEN_US, CLOSED_US = 1000, 2000
+# servo calibration (python -m driptwin.valvecal): angle at u=0 (open) and
+# u=1 (pinched shut). Must match open_deg/closed_deg in valve_cal.json.
+OPEN_DEG, CLOSED_DEG = 40.0, 90.0
+ANGLE_MIN, ANGLE_MAX = 0.0, 90.0     # mechanical range of the valve, never exceeded
 
 servo = PWM(Pin(15)); servo.freq(50)
 buzzer = Pin(13, Pin.OUT); buzzer.value(0)
@@ -41,8 +43,8 @@ def send(obj):
 
 
 def write_servo(u):
-    us = OPEN_US + (CLOSED_US - OPEN_US) * u
-    servo.duty_ns(int(us * 1000))
+    deg = min(ANGLE_MAX, max(ANGLE_MIN, OPEN_DEG + (CLOSED_DEG - OPEN_DEG) * u))
+    servo.duty_ns(int((500 + 2000 * deg / 180) * 1000))     # SG90: 500-2500 us = 0-180 deg
 
 
 # Boot closed: an unattended reboot must never open the line.

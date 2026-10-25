@@ -15,13 +15,18 @@ import asyncio
 import json
 import threading
 import time
+from pathlib import Path
 
 import cv2
 
+from dataclasses import replace
+
 from .config import CONFIG
+from .physics import load_valve
 from .sim import SimPlant, SyntheticChamber
 from .storage import Store
 from .twin import DripTwin
+from .valvecal import CAL_FILE as VALVE_CAL
 from .vision import DropDetector, ROI, ROIConfig, CameraCounter
 
 
@@ -32,7 +37,7 @@ class SimDevice:
         self.on_drop = on_drop
         self.plant = SimPlant()
         self.chamber = SyntheticChamber(fps=self.FPS)
-        self.detector = DropDetector(ROIConfig(ROI(95, 30, 50, 50)))
+        self.detector = DropDetector(ROIConfig(ROI(85, 225, 70, 40)))
         self.jpeg: bytes | None = None
         self.status = {"u": 1.0, "host": True}
         self._frame_n = 0
@@ -45,7 +50,7 @@ class SimDevice:
 
     def step(self, t: float, dt: float) -> None:
         drops = self.plant.step(t, dt)
-        growth = min(1.0, self.plant._accum / self.plant.drop_vol)
+        growth = min(1.0, self.plant._accum * self.plant.drop_factor)
         frame = self.chamber.frame(growth, bool(drops))
         if self.detector.process(frame, t):
             self.on_drop(t)
@@ -70,11 +75,39 @@ class SimDevice:
         return action
 
 
+FIRMWARE = Path(__file__).resolve().parent.parent / "firmware" / "main.py"
+
+
+def load_firmware(ser) -> None:
+    """Paste firmware/main.py into the Pico's RAM through the raw REPL and run it.
+    Nothing is saved, so the Pico must be at a blank REPL (no main.py); a reboot
+    (its watchdog, after Ctrl-C) brings it back to that REPL."""
+    ser.write(b"\r\x03\x03")
+    time.sleep(0.2)
+    ser.write(b"\x01")
+    time.sleep(0.3)
+    ser.reset_input_buffer()
+    code = FIRMWARE.read_bytes()
+    for i in range(0, len(code), 256):
+        ser.write(code[i:i + 256])
+        time.sleep(0.01)
+    ser.write(b"\x04")
+    time.sleep(0.5)
+    if b"OK" not in ser.read(200):
+        raise RuntimeError("Pico did not take the firmware: is it at a blank REPL (no main.py)?")
+
+
 class PicoDevice:
     def __init__(self, on_drop, port: str, camera: int | str | None = 0):
         import serial
         self.on_drop = on_drop
-        self.ser = serial.Serial(port, 115200, timeout=0.1)
+        try:
+            self.ser = serial.Serial(port, 115200, timeout=0.1)
+        except serial.SerialException as e:
+            raise SystemExit(f"Can't open the Pico on {port}: another program is using it "
+                             f"(flowctl, valvecal, servo.py, mpremote, Thonny?). Close it and "
+                             f"start again.\n  ({e})") from None
+        load_firmware(self.ser)
         self.status: dict = {}
         self.alarms: list[dict] = []
         self.camera = CameraCounter(on_drop, camera) if camera is not None else None
@@ -100,6 +133,15 @@ class PicoDevice:
 
     def disturb(self, action: str) -> str:
         return "real hardware: do it by hand"
+
+    def close(self) -> None:
+        """Leave the line as found: open the valve, then stop the firmware."""
+        for _ in range(6):
+            self.command(0.0)
+            self.heartbeat()
+            time.sleep(0.5)
+        self.ser.write(b"\x03")
+        self.ser.close()
 
     def _reader(self) -> None:
         while True:
@@ -145,7 +187,14 @@ class Runtime:
     def __init__(self, sim: bool = True, port: str | None = None, camera: int | str | None = 0,
                  head_cm: float | None = None, monitor: bool = False):
         self.lock = threading.Lock()
-        self.twin = DripTwin(head_cm=head_cm, monitor_only=monitor)
+        cfg = CONFIG
+        if not sim and not monitor and VALVE_CAL.exists():
+            # the real valve: use its measured curve instead of the generic model
+            cfg = replace(CONFIG, physics=load_valve(VALVE_CAL))
+            v = cfg.physics.valve
+            print(f"[runtime] valve calibration {VALVE_CAL.name}: open {v.open_deg:g} deg, "
+                  f"shut {v.closed_deg:g} deg, {v.q_ml_min[0] * 60:.0f} mL/h wide open")
+        self.twin = DripTwin(cfg, head_cm=head_cm, monitor_only=monitor)
         self.t0 = time.monotonic()
         if sim:
             self.device = SimDevice(self._on_drop)
@@ -155,7 +204,7 @@ class Runtime:
             self.device = PicoDevice(self._on_drop, port, camera)
         self.sim = sim
         self.monitor = monitor
-        self.store = Store(prefix="sim" if sim else "inf")
+        self.store = Store(physics=cfg.physics)
         self.subscribers: set[asyncio.Queue] = set()
         self._events_sent = 0
         self._fw_alarms_seen = 0
@@ -168,6 +217,8 @@ class Runtime:
             t -= self.t0      # the webcam thread stamps in monotonic time
         with self.lock:
             self.twin.on_drop(t)
+            snap = self.twin.snapshot()
+        self.store.drop(snap, t)
 
     def log(self, kind: str, data: dict) -> None:
         self.store.event(kind, "info", json.dumps(data, default=str), data)
@@ -194,7 +245,7 @@ class Runtime:
                 self._broadcast({"type": "state", "state": snap,
                                  "events": [e.__dict__ for e in new]})
                 if (snap["order"] or self.monitor) and t >= next_tel:
-                    next_tel = t + 2.0
+                    next_tel = t + 1.0
                     self.store.telemetry(snap)
             if t >= next_hb:
                 next_hb = t + 1.0
